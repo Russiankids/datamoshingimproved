@@ -4,6 +4,10 @@ import os
 import argparse
 import subprocess
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
 
 parser = argparse.ArgumentParser()
 parser.add_argument('input_video', type=str, help='File to be moshed')
@@ -21,96 +25,101 @@ fps = args['fps']
 delta = args['delta']
 output_video = args['output_video']
 
-input_avi = 'datamoshing_input.avi'  # must be an AVI so i-frames can be located in binary file
+input_avi = 'datamoshing_input.avi'
 output_avi = 'datamoshing_output.avi'
 
-# convert original file to avi
-subprocess.call('ffmpeg -loglevel error -y -i ' + input_video + ' ' +
-                ' -crf 0 -pix_fmt yuv420p -bf 0 -b 10000k -r ' + str(fps) + ' ' +
-                input_avi, shell=True)
+frame_start = b'\x30\x30\x64\x63'
+iframe = b'\x00\x01\xB0'
+pframe = b'\x00\x01\xB6'
 
-# open up the new files so we can read and write bytes to them
-in_file = open(input_avi, 'rb')
-out_file = open(output_avi, 'wb')
+
+def convert_input():
+    print(f">> Converting {input_video} to AVI...")
+    subprocess.call('ffmpeg -loglevel error -y -i ' + input_video +
+                    ' -crf 0 -pix_fmt yuv420p -bf 0 -g 60 -r ' + str(fps) + ' ' +
+                    input_avi, shell=True)
+
+
+def stream_frames(file_path):
+    """Generator to yield frames while updating progress bar."""
+    file_size = os.path.getsize(file_path)
+    pbar = tqdm(total=file_size, unit='B', unit_scale=True, desc=">> Moshing") if tqdm else None
+
+    with open(file_path, 'rb') as f:
+        chunk_size = 1024 * 1024
+        remainder = b''
+
+        data = f.read(chunk_size)
+        if pbar: pbar.update(len(data))
+        header_end = data.find(frame_start)
+        if header_end != -1:
+            yield data[:header_end]
+            remainder = data[header_end:]
+
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                if remainder: yield remainder
+                break
+
+            if pbar: pbar.update(len(chunk))
+            combined = remainder + chunk
+            parts = combined.split(frame_start)
+
+            for part in parts[:-1]:
+                if part: yield frame_start + part
+            remainder = parts[-1]
+
+    if pbar: pbar.close()
 
 
 def cleanup():
-    # gets rid of the in-between files so they're not crudding up your system
-    in_file.close()
-    out_file.close()
-    os.remove(input_avi)
-    os.remove(output_avi)
+    if os.path.exists(input_avi): os.remove(input_avi)
+    if os.path.exists(output_avi): os.remove(output_avi)
     exit(0)
 
 
-# because we used 'rb' above when the file is read the output is in byte format instead of Unicode strings
-in_file_bytes = in_file.read()
+def mosh():
+    frames_gen = stream_frames(input_avi)
+    try:
+        header = next(frames_gen)
+    except StopIteration:
+        return
 
-# 0x30306463 which is ASCII 00dc signals the end of a frame.
-frame_start = bytes.fromhex('30306463')
+    with open(output_avi, 'wb') as out_file:
+        out_file.write(header)
+        repeat_frames = []
+        video_frame_count = 0
 
-# get all frames of video
-frames = in_file_bytes.split(frame_start)
+        for frame in frames_gen:
+            is_iframe = iframe in frame[0:30]
+            is_pframe = pframe in frame[0:30]
 
-# write header
-out_file.write(frames[0])
-frames = frames[1:]
+            if is_iframe or is_pframe:
+                video_frame_count += 1
 
-# 0x0001B0 signals the beginning of an i-frame, 0x0001B6 signals a p-frame
-iframe = bytes.fromhex('0001B0')
-pframe = bytes.fromhex('0001B6')
-
-
-n_video_frames = len([frame for frame in frames if frame[5:8] == iframe or frame[5:8] == pframe])
-if end_frame < 0:
-    end_frame = n_video_frames
-
-
-def write_frame(frame):
-    out_file.write(frame_start + frame)
-
-
-def mosh_iframe_removal():
-    for index, frame in enumerate(frames):
-        if index < start_frame or end_frame < index or frame[5:8] != iframe:
-            out_file.write(frame_start + frame)
-
-
-def mosh_delta_repeat(n_repeat):
-    # check we have enough room to repeat
-    if n_repeat > end_frame - start_frame:
-        print('not enough frames to repeat')
-        cleanup()
-
-    repeat_frames = []
-    repeat_index = 0
-    for index, frame in enumerate(frames):
-        # I don't know why this is a thing but it is
-        if (frame[5:8] != iframe and frame[5:8] != pframe) or not start_frame <= index < end_frame:
-            write_frame(frame)
-            continue
-
-        if len(repeat_frames) < n_repeat and frame[5:8] != iframe:
-            # get initial frames to write
-            repeat_frames.append(frame)
-            write_frame(frame)
-        elif len(repeat_frames) == n_repeat:
-            write_frame(repeat_frames[repeat_index])
-            repeat_index = (repeat_index + 1) % n_repeat
-        else:
-            # this case happens when the starting frame is an iframe
-            write_frame(frame)
+            if not delta:
+                if start_frame <= video_frame_count <= end_frame and is_iframe:
+                    continue
+                out_file.write(frame)
+            else:
+                if video_frame_count < start_frame or (end_frame != -1 and video_frame_count > end_frame):
+                    out_file.write(frame)
+                else:
+                    if len(repeat_frames) < delta:
+                        if not is_iframe:
+                            repeat_frames.append(frame)
+                        out_file.write(frame)
+                    else:
+                        out_file.write(repeat_frames[video_frame_count % delta])
 
 
-if delta:
-    mosh_delta_repeat(delta)
-else:
-    mosh_iframe_removal()
+convert_input()
+mosh()
 
-
-# export the video
-subprocess.call('ffmpeg -loglevel error -y -i ' + output_avi + ' ' +
-                ' -crf 18 -pix_fmt yuv420p -vcodec libx264 -acodec aac -b 10000k -r ' + str(fps) + ' ' +
+print(f">> Exporting to {output_video}...")
+subprocess.call('ffmpeg -loglevel error -y -i ' + output_avi +
+                ' -crf 18 -pix_fmt yuv420p -vcodec libx264 -acodec aac -r ' + str(fps) + ' ' +
                 output_video, shell=True)
 
 cleanup()
